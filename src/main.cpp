@@ -1,18 +1,28 @@
 #include <Arduino.h>
 
+#include <Arduino.h>
+
 // ===== Squid Game: Red Light Green Light - Raspberry Pi Pico =====
-// Keypad (4x4) + AM312 PIR + passive piezo + 8x8 MAX7219 LED matrix
-// All display handled via MD_Parola (single object, no handoff).
+// Keypad (4x4) + AM312 PIR + passive piezo + 8x8 MAX7219 matrix (via MD_Parola)
+// + 4 mini-game target sensors, each reveals one digit of the code.
+//
+// Targets:
+//   Digit 1 -> SW-18010P vibration sensor (GP26)  - hit with ball
+//   Digit 2 -> Limit switch              (GP27)  - press lever
+//   Digit 3 -> IR proximity sensor       (GP28)  - bring object near
+//   Digit 4 -> Light slot 10mm sensor    (GP18)  - drop ball through slot
 //
 // Matrix scheme:
 //   Game start  -> 3 lives shown briefly (small X layout)
 //   Red light   -> steady big X (alarm active, do not walk)
 //   Green light -> off (move)
 //   Caught      -> big X blinks 3x, then remaining lives as small X's
+//   Mini-game hit -> shows that digit of the code (2s)
 //   Game over   -> full blink, then "GAME OVER" scrolls
 //   Win         -> checkmark
 //
-// Enter the secret code then press DISARM to win, before lives run out.
+// Goal: hit the 4 targets to learn the code, enter code + DISARM to win,
+//       before the red-light motion detector drains all your lives.
 
 #include <MD_Parola.h>
 #include <MD_MAX72xx.h>
@@ -34,6 +44,14 @@ bool lastState[ROWS][COLS] = {false};
 const int PIR_PIN   = 15;
 const int PIEZO_PIN = 22;
 
+// ---------- Target sensors (one per mini-game, reveals one digit) ----------
+// index 0 -> digit 1 (vibration), 1 -> digit 2 (limit), 2 -> digit 3 (IR prox), 3 -> digit 4 (light slot)
+const int NUM_SENSORS = 4;
+const int sensorPins[NUM_SENSORS] = {26, 27, 28, 18};
+bool sensorLast[NUM_SENSORS] = {true, true, true, true};   // previous reading (HIGH = idle)
+unsigned long lastHit[NUM_SENSORS] = {0, 0, 0, 0};
+const unsigned long HIT_COOLDOWN_MS = 1500;
+
 // ---------- LED Matrix (all via MD_Parola) ----------
 #define HARDWARE_TYPE MD_MAX72XX::FC16_HW
 #define MAX_DEVICES 1
@@ -41,6 +59,7 @@ const int PIEZO_PIN = 22;
 #define CLK_PIN 21
 #define CS_PIN  20
 MD_Parola P = MD_Parola(HARDWARE_TYPE, DIN_PIN, CLK_PIN, CS_PIN, MAX_DEVICES);
+MD_MAX72XX *mx = nullptr;
 
 // ---------- Secret code ----------
 const char* SECRET_CODE = "1234";
@@ -57,8 +76,7 @@ int lives = 3;
 const int START_LIVES = 3;
 const unsigned long RED_GRACE_MS = 800;
 
-// ---------- Bitmaps (column-based for Parola: one byte per COLUMN, LSB = top row) ----------
-// Big X (8 columns)
+// ---------- Bitmaps (column-format: one byte per column, LSB = top row) ----------
 const uint8_t XMARK_COL[8] = {
   0b10000001,
   0b01000010,
@@ -70,7 +88,6 @@ const uint8_t XMARK_COL[8] = {
   0b10000001
 };
 
-// Checkmark (8 columns)
 const uint8_t CHECK_COL[8] = {
   0b00000000,
   0b00000000,
@@ -82,22 +99,32 @@ const uint8_t CHECK_COL[8] = {
   0b00001000
 };
 
-// Small 3x3 X glyph (column bits, LSB = top)
 const uint8_t MINI_X_COL[3] = {
   0b101,
   0b010,
   0b101
 };
 
-// ---------- Low-level matrix access through Parola's MD_MAX72XX ----------
-MD_MAX72XX *mx = nullptr;   // set in setup() from Parola
+// 5-wide x 7-tall digits, column-format (one byte per column, LSB = top row)
+const uint8_t DIGIT_COL[10][5] = {
+  {0b0111110,0b1000001,0b1000001,0b1000001,0b0111110}, // 0
+  {0b0000000,0b0000010,0b1111111,0b0000000,0b0000000}, // 1
+  {0b1000010,0b1100001,0b1010001,0b1001001,0b1000110}, // 2
+  {0b0100001,0b1000001,0b1000101,0b1001011,0b0110001}, // 3
+  {0b0011000,0b0010100,0b0010010,0b1111111,0b0010000}, // 4
+  {0b0100111,0b1000101,0b1000101,0b1000101,0b0111001}, // 5
+  {0b0111110,0b1001001,0b1001001,0b1001001,0b0110010}, // 6
+  {0b0000001,0b1110001,0b0001001,0b0000101,0b0000011}, // 7
+  {0b0110110,0b1001001,0b1001001,0b1001001,0b0110110}, // 8
+  {0b0100110,0b1001001,0b1001001,0b1001001,0b0111110}  // 9
+};
 
+// ---------- Low-level matrix drawing through Parola's MD_MAX72XX ----------
 void displayClearRaw() {
   mx->clear();
   mx->update();
 }
 
-// Draw a full 8-column bitmap
 void displayBitmapCol(const uint8_t col[8]) {
   mx->clear();
   for (uint8_t c = 0; c < 8; c++)
@@ -111,7 +138,6 @@ void displayAllOn() {
   mx->update();
 }
 
-// Place a mini X with top-left at (ox, oy); column-addressed
 void drawMiniXAt(int ox, int oy) {
   for (uint8_t c = 0; c < 3; c++)
     for (uint8_t r = 0; r < 3; r++)
@@ -128,6 +154,14 @@ void displayLives(int n) {
   const int posY[3] = {0, 3, 5};
   for (int i = 0; i < n && i < 3; i++)
     drawMiniXAt(posX[i], posY[i]);
+  mx->update();
+}
+
+void displayDigit(int d) {
+  if (d < 0 || d > 9) return;
+  mx->clear();
+  for (uint8_t c = 0; c < 5; c++)
+    mx->setColumn(c + 1, DIGIT_COL[d][c]);   // +1 nudges it right
   mx->update();
 }
 
@@ -167,6 +201,7 @@ void soundStart()    { beep(660, 100); beep(880, 100); beep(1100, 150); }
 void soundWin()      { beep(880,120); beep(1100,120); beep(1320,120); beep(1760,300); }
 void soundKey()      { beep(1200, 40); }
 void soundBadCode()  { beep(180, 200); beep(140, 300); }
+void soundReveal()   { beep(1320, 80); beep(1660, 120); }
 
 // ---------- Keypad scan ----------
 const char* scanKeypad() {
@@ -195,29 +230,66 @@ void printLives() {
 void resetCode() { enteredLen = 0; entered[0] = '\0'; }
 bool isDigit(const char* k) { return strlen(k) == 1 && k[0] >= '0' && k[0] <= '9'; }
 
+// ---------- Mini-game digit reveal ----------
+void revealDigit(int idx) {
+  if (idx < 0 || idx >= (int)strlen(SECRET_CODE)) return;
+  char ch = SECRET_CODE[idx];
+  int d = ch - '0';
+  Serial.print(">>> TARGET ");
+  Serial.print(idx + 1);
+  Serial.print(" HIT - code digit ");
+  Serial.print(idx + 1);
+  Serial.print(" is: ");
+  Serial.println(ch);
+
+  soundReveal();
+  displayDigit(d);
+  delay(2000);                 // show the digit for 2s
+
+  // Restore the display appropriate to the current state
+  if (state == RED) displayBitmapCol(XMARK_COL);
+  else              displayClearRaw();
+}
+
+// Edge-detected sensor check: fires once on the HIGH->LOW transition (active LOW),
+// so sensors that rest in the triggered state (slot/proximity) reveal only once.
+void checkSensors() {
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    bool reading = (digitalRead(sensorPins[i]) == LOW);   // true = triggered
+    if (reading && !sensorLast[i]) {                      // new trigger edge
+      if (millis() - lastHit[i] > HIT_COOLDOWN_MS) {
+        lastHit[i] = millis();
+        revealDigit(i);
+      }
+    }
+    sensorLast[i] = reading;
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   for (int r = 0; r < ROWS; r++) { pinMode(rowPins[r], OUTPUT); digitalWrite(rowPins[r], HIGH); }
   for (int c = 0; c < COLS; c++) pinMode(colPins[c], INPUT_PULLUP);
   pinMode(PIR_PIN, INPUT);
   pinMode(PIEZO_PIN, OUTPUT);
+  for (int i = 0; i < NUM_SENSORS; i++) pinMode(sensorPins[i], INPUT_PULLUP);
 
   P.begin();
   P.setIntensity(2);
   P.displayClear();
-  mx = P.getGraphicObject();   // raw MD_MAX72XX for our bitmap drawing
+  mx = P.getGraphicObject();
 
   Serial.println("PIR warming up (~5s)... then press ARM to start.");
   delay(5000);
-  Serial.println("Ready. Press ARM to start. Enter the code + DISARM to win!");
+  Serial.println("Ready. Press ARM to start. Hit the 4 targets, then enter code + DISARM!");
 }
 
 void startGreen() {
   state = GREEN;
   phaseStart = millis();
   phaseDuration = random(2000, 5000);
-  Serial.println(">>> GREEN LIGHT - move & enter code!");
-  displayClearRaw();          // OFF = safe to move
+  Serial.println(">>> GREEN LIGHT - move & play!");
+  displayClearRaw();
   soundGreen();
 }
 
@@ -226,7 +298,7 @@ void startRed() {
   phaseStart = millis();
   phaseDuration = random(2500, 4500);
   Serial.println(">>> RED LIGHT - freeze! (alarm active)");
-  displayBitmapCol(XMARK_COL);   // steady big X = do not walk
+  displayBitmapCol(XMARK_COL);
   soundRed();
 }
 
@@ -235,8 +307,11 @@ void startGame() {
   lives = START_LIVES;
   resetCode();
   printLives();
-  displayLives(lives);         // show 3 lives briefly
+  displayLives(lives);
   soundStart();
+  // sync sensor baseline so a resting-triggered sensor doesn't fire immediately
+  for (int i = 0; i < NUM_SENSORS; i++)
+    sensorLast[i] = (digitalRead(sensorPins[i]) == LOW);
   delay(1500);
   startGreen();
 }
@@ -259,6 +334,9 @@ void gameOver() {
 
 void loop() {
   const char* key = scanKeypad();
+
+  // Mini-game targets active during play
+  if (state == GREEN || state == RED) checkSensors();
 
   if (key) {
     if (strcmp(key, "ARM") == 0 && (state == IDLE || state == GAMEOVER || state == WIN)) {
@@ -309,13 +387,13 @@ void loop() {
       if (elapsed > RED_GRACE_MS && motionDetected()) {
         lives--;
         Serial.println("!!! MOTION DURING RED LIGHT - CAUGHT !!!");
-        blinkBigX(3);                  // short blink of the big X
+        blinkBigX(3);
         if (lives > 0) {
           Serial.print("Life lost! "); printLives();
           soundLifeLost();
-          displayLives(lives);         // remaining lives as small X's
+          displayLives(lives);
           delay(1500);
-          delay(500);                  // ride out remainder of PIR hold
+          delay(500);
           startRed();
         } else {
           gameOver();
