@@ -1,8 +1,6 @@
 #include <Arduino.h>
 
-#include <Arduino.h>
-
-// ===== Squid Game: Red Light Green Light - Raspberry Pi Pico =====
+// ===== Kraak de Kluis / King's Day Heist - Raspberry Pi Pico =====
 // Keypad (4x4) + AM312 PIR + passive piezo + 8x8 MAX7219 matrix (via MD_Parola)
 // + 4 mini-game target sensors, each reveals one digit of the code.
 //
