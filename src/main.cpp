@@ -46,7 +46,10 @@ const int PIEZO_PIN = 22;
 // index 0 -> digit 1 (vibration), 1 -> digit 2 (limit), 2 -> digit 3 (IR prox), 3 -> digit 4 (light slot)
 const int NUM_SENSORS = 4;
 const int sensorPins[NUM_SENSORS] = {26, 27, 28, 18};
-bool sensorLast[NUM_SENSORS] = {true, true, true, true};   // previous reading (HIGH = idle)
+// Vibration sensor & limit switch (2-pin, short to GND when triggered) are active LOW.
+// IR proximity & light slot (3-pin, own output driver) are active HIGH.
+const bool sensorActiveHigh[NUM_SENSORS] = {false, false, true, true};
+bool sensorLast[NUM_SENSORS] = {false, false, false, false};   // previous triggered state
 unsigned long lastHit[NUM_SENSORS] = {0, 0, 0, 0};
 const unsigned long HIT_COOLDOWN_MS = 1500;
 
@@ -249,11 +252,16 @@ void revealDigit(int idx) {
   else              displayClearRaw();
 }
 
-// Edge-detected sensor check: fires once on the HIGH->LOW transition (active LOW),
+bool sensorTriggered(int i) {
+  bool raw = digitalRead(sensorPins[i]);
+  return sensorActiveHigh[i] ? (raw == HIGH) : (raw == LOW);
+}
+
+// Edge-detected sensor check: fires once per trigger (per sensor's own polarity),
 // so sensors that rest in the triggered state (slot/proximity) reveal only once.
 void checkSensors() {
   for (int i = 0; i < NUM_SENSORS; i++) {
-    bool reading = (digitalRead(sensorPins[i]) == LOW);   // true = triggered
+    bool reading = sensorTriggered(i);
     if (reading && !sensorLast[i]) {                      // new trigger edge
       if (millis() - lastHit[i] > HIT_COOLDOWN_MS) {
         lastHit[i] = millis();
@@ -309,7 +317,7 @@ void startGame() {
   soundStart();
   // sync sensor baseline so a resting-triggered sensor doesn't fire immediately
   for (int i = 0; i < NUM_SENSORS; i++)
-    sensorLast[i] = (digitalRead(sensorPins[i]) == LOW);
+    sensorLast[i] = sensorTriggered(i);
   delay(1500);
   startGreen();
 }
